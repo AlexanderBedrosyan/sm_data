@@ -65,7 +65,14 @@ SCROLL_STEP_PX = 500
 SCROLL_PAUSE = 1.2
 
 # Stop scrolling after this many consecutive steps with no new names found
-MAX_EMPTY_SCROLLS = 5
+MAX_EMPTY_SCROLLS = 10
+
+# Set to True to save dialog HTML snapshots per scroll pass and print per-name debug info
+DEBUG = False
+
+# Holds the raw Selenium WebElement for the aria-label shares container.
+# Populated at runtime so you can inspect it at the breakpoint().
+_DEBUG_SHARES_ARIA_EL = None
 
 # Words that appear as link text but are NOT sharer names
 SKIP_WORDS = {
@@ -382,108 +389,237 @@ def find_shares_dialog(driver: webdriver.Chrome):
     return None
 
 
-def collect_names_from_dialog(driver: webdriver.Chrome, dialog) -> list[str]:
+def collect_names_from_dialog(driver: webdriver.Chrome, dialog, debug: bool = False) -> list[str]:
     """
-    Scroll through the shares dialog and collect sharer names.
-    Returns a list with duplicates preserved for counting.
+    Scroll through the shares dialog and return ALL sharer names (with duplicates).
 
-    Facebook's shares dialog does NOT use real profile hrefs for the sharer
-    name links; instead it uses href="#". The name appears in two reliable
-    places:
-      1. <div data-ad-rendering-role="profile_name"> … <b><span>Name</span></b> …
-      2. <a href="#" role="link" aria-label="Name">  (avatar link)
-    We try both and de-duplicate.
+    Duplicates are intentional: the same person can share multiple times and
+    each share is a separate [role="article"] card. build_share_counter() will
+    count how many times each name appears.
+
+    The dialog WebElement is NEVER used for DOM queries after being passed in —
+    it can go stale silently.  Everything is queried fresh from the document
+    root on every iteration using driver.find_elements or execute_script.
     """
 
-    # Regex to detect timestamp strings in any language:
+    SKIP_ARIA = {
+        "close", "actions for this post", "show attachment",
+        "loading...", "menu", "more", "back",
+        "see who reacted to this", "shared with public", "shared with friends",
+        "shared with friends of friends", "shared with only me",
+    }
+
     TIMESTAMP_RE = re.compile(
         r'^(\d+\s*(m|h|d|w|s|мин|ч|д|лв|сек|min|sec|hr|hrs|just\s*now|now))$',
         re.I | re.U,
     )
 
-    # Labels that are NOT sharer names
-    SKIP_ARIA = {
-        "close", "actions for this post", "show attachment",
-        "loading...", "menu", "more", "back",
-    }
-
-    def _is_valid_name(text: str) -> bool:
-        if not text or len(text) < 2:
+    def _is_valid(name: str) -> bool:
+        if not name or len(name) < 2:
             return False
-        if TIMESTAMP_RE.match(text):
+        if TIMESTAMP_RE.match(name):
             return False
-        if text.lower() in SKIP_WORDS or text.lower() in SKIP_ARIA:
+        if name.lower() in SKIP_WORDS or name.lower() in SKIP_ARIA:
             return False
-        if text.isdigit() or re.match(r'^[\d\s,·.]+$', text):
+        if name.isdigit() or re.match(r'^[\d\s,·.]+$', name):
             return False
         return True
 
-    def _extract_from_soup(soup) -> list[str]:
-        found: list[str] = []
-        found_set: set[str] = set()
+    global _DEBUG_SHARES_ARIA_EL
+    _DEBUG_SHARES_ARIA_EL = dialog
 
-        def _add(text: str) -> None:
-            if _is_valid_name(text) and text not in found_set:
-                found_set.add(text)
-                found.append(text)
+    SKIP_LIST = list(SKIP_ARIA | {w.lower() for w in SKIP_WORDS})
 
-        # ── Strategy 1: data-ad-rendering-role="profile_name" ──────────────
-        for div in soup.find_all(attrs={"data-ad-rendering-role": "profile_name"}):
-            b = div.find("b")
-            if b:
-                _add(b.get_text(strip=True))
-                continue
-            heading = div.find(["h1", "h2", "h3"])
-            if heading:
-                _add(heading.get_text(strip=True))
+    # ── JS: extract name from ONE article element ─────────────────────────
+    # arguments[0] = the article WebElement
+    # arguments[1] = SKIP_LIST
+    #
+    # KEY FIX — dirty name "Велислава ХристоваPosted to PAGE":
+    #   The profile_name div contains:
+    #     <a href="/profile">Велислава Христова</a> posted to <a href="/page">PAGE</a>
+    #   Strategy order: a[role="link"] → profile_name div → a[aria-label].
+    #   Returns {name, href, tid} so the caller can deduplicate by share event,
+    #   not by person (same person sharing twice → two distinct tid values).
+    JS_NAME_FROM_ARTICLE = """
+        var art  = arguments[0];
+        var skip = arguments[1];
 
-        # ── Strategy 2: aria-label on <a role="link"> (any href) ─────────────
-        # Catches entries where the avatar link carries the name as aria-label,
-        # regardless of whether href is "#" or a real profile URL.
-        for a in soup.find_all("a", role="link"):
-            label = (a.get("aria-label") or "").strip()
-            if label and label.lower() not in SKIP_ARIA:
-                _add(label)
+        function ok(t) {
+            t = (t || '').trim();
+            return t.length > 1 && skip.indexOf(t.toLowerCase()) < 0 ? t : null;
+        }
 
-        return found
+        var name = null, href = '', tid = '';
 
-    all_names: list[str] = []
-    seen: set[str] = set()
-    empty_scrolls = 0
+        // Strategy 1: a[role="link"] – most reliable selector in shares dialog.
+        // Facebook always renders the sharer's profile name as a role=link anchor.
+        var roleLinks = art.querySelectorAll('a[role="link"]');
+        for (var i = 0; i < roleLinks.length; i++) {
+            var t = ok(roleLinks[i].textContent);
+            if (t) { name = t; href = roleLinks[i].href || ''; break; }
+        }
 
-    while empty_scrolls < MAX_EMPTY_SCROLLS:
+        // Strategy 2: profile_name div (older / alternative layout)
+        if (!name) {
+            var pn = art.querySelector('[data-ad-rendering-role="profile_name"]');
+            if (pn) {
+                var a = pn.querySelector('a');
+                if (a) { var t = ok(a.textContent); if (t) { name = t; href = a.href || ''; } }
+                if (!name) {
+                    var b = pn.querySelector('b');
+                    if (b) { var s = b.querySelector('span'); var t = ok((s||b).textContent); if (t) name = t; }
+                }
+            }
+        }
+
+        // Strategy 3: avatar/profile link aria-label
+        if (!name) {
+            var aLinks = art.querySelectorAll('a[aria-label]');
+            for (var i = 0; i < aLinks.length; i++) {
+                var t = ok(aLinks[i].getAttribute('aria-label'));
+                if (t) { name = t; href = aLinks[i].href || ''; break; }
+            }
+        }
+
+        if (!name) return null;
+
+        // Extract a per-SHARE unique ID (the share's own permalink).
+        // This lets us count the same person sharing twice as two distinct events.
+        var shareLinks = art.querySelectorAll('a[href*="/posts/"], a[href*="/permalink/"]');
+        for (var i = 0; i < shareLinks.length; i++) {
+            var h = (shareLinks[i].getAttribute('href') || '').trim();
+            if (h.length > 15) { tid = h; break; }
+        }
+        if (!tid) { var te = art.querySelector('[data-utime]'); if (te) tid = te.getAttribute('data-utime') || ''; }
+        if (!tid) { var te = art.querySelector('abbr, time'); if (te) tid = (te.textContent || '').trim(); }
+
+        return {name: name, href: href, tid: tid};
+    """
+
+    # ── JS: scroll the dialog so the next batch of articles loads ─────────
+    # Targets ONLY the dialog, not the whole page.
+    # Three triggers every call:
+    #   1. scrollTop = scrollHeight on every overflow container inside the dialog
+    #   2. WheelEvent on those containers + the dialog root
+    #   3. scrollIntoView on the very last child of the last article
+    #      → this fires Facebook's IntersectionObserver (virtual-list loader)
+    JS_SCROLL = """
+        var dialogs = document.querySelectorAll('[role="dialog"]');
+        var dlg     = dialogs.length ? dialogs[dialogs.length - 1] : null;
+        if (!dlg) return;
+
+        var all = dlg.querySelectorAll('*');
+        for (var i = 0; i < all.length; i++) {
+            var ov = window.getComputedStyle(all[i]).overflowY;
+            if (ov === 'scroll' || ov === 'auto') {
+                all[i].scrollTop = all[i].scrollHeight;
+                all[i].dispatchEvent(new WheelEvent('wheel', {
+                    deltaY: 800, deltaMode: 0, bubbles: true, cancelable: true
+                }));
+            }
+        }
+        dlg.dispatchEvent(new WheelEvent('wheel', {
+            deltaY: 800, deltaMode: 0, bubbles: true, cancelable: true
+        }));
+
+        var arts = dlg.querySelectorAll('[role="article"]');
+        if (arts.length > 0) {
+            var last = arts[arts.length - 1];
+            // scroll the last child of the last article into view
+            // → this triggers IntersectionObserver for the loading sentinel below it
+            var lastChild = last.lastElementChild || last;
+            lastChild.scrollIntoView({behavior: 'instant', block: 'end'});
+        }
+    """
+
+    all_names: list[str] = []  # duplicates kept — same person sharing N times = N entries
+    # Dedup key = (name, profile_href, share_tid).
+    # – Prevents false duplicates when the virtual list recycles DOM nodes across passes.
+    # – Still allows genuine multiple shares by the same person (different tid per share).
+    seen_shares: set[tuple] = set()
+    empty_rounds = 0
+    iteration = 0
+
+    # Wait up to 15 s for the first sharer cards to appear
+    print("[*] Waiting for sharer cards to render...")
+    for _w in range(15):
+        _initial = driver.find_elements(
+            By.CSS_SELECTOR, '[role="dialog"] [role="article"]')
+        if _initial:
+            break
+        time.sleep(1.0)
+    else:
+        print("[!] No sharer articles appeared in 15 s – dialog may not be open.")
+        return []
+    print(f"[*] Found first batch ({len(_initial)} card(s)). Collecting all names...")
+
+    while empty_rounds < MAX_EMPTY_SCROLLS:
+
+        # ── fetch ALL currently visible articles fresh from the document root ─
         try:
-            inner_html = dialog.get_attribute("innerHTML")
-            soup = BeautifulSoup(inner_html, "html.parser")
+            articles = driver.find_elements(
+                By.CSS_SELECTOR, '[role="dialog"] [role="article"]')
         except Exception:
             break
 
         new_this_round = 0
-        for name in _extract_from_soup(soup):
-            if name not in seen:
-                seen.add(name)
-                all_names.append(name)
-                new_this_round += 1
+        for article in articles:
+            try:
+                result = driver.execute_script(JS_NAME_FROM_ARTICLE, article, SKIP_LIST)
+            except (StaleElementReferenceException, Exception):
+                continue
+
+            if not result:
+                continue
+
+            # JS now returns a dict; tolerate plain string fallback just in case
+            if isinstance(result, dict):
+                name = result.get('name') or ''
+                href = result.get('href') or ''
+                tid  = result.get('tid')  or ''
+            else:
+                name, href, tid = str(result), '', ''
+
+            if not name or not _is_valid(name):
+                continue
+
+            # Build a unique key per share-event (not per person).
+            # If we have a permalink (tid) or at least a profile URL (href), use them;
+            # otherwise fall back to name-only (slight risk of missing a share, but
+            # name-only dedup is the safer choice over counting ghost duplicates).
+            key: tuple = (name, href, tid) if (href or tid) else (name,)
+            if key in seen_shares:
+                continue   # already recorded this exact share
+
+            seen_shares.add(key)
+            all_names.append(name)
+            new_this_round += 1
+            print(f"  [+] ({len(all_names)}) {name}")
+
+        print(f"  [pass {iteration}] DOM articles: {len(articles)}, "
+              f"new unique shares: {new_this_round}, "
+              f"total so far: {len(all_names)}, "
+              f"empty rounds: {empty_rounds}/{MAX_EMPTY_SCROLLS}")
+
+        if debug:
+            try:
+                html = driver.execute_script(
+                    "var d=document.querySelectorAll('[role=\"dialog\"]');"
+                    "return d.length?d[d.length-1].outerHTML:'';")
+                with open(f"debug_dialog_pass{iteration}.html", "w", encoding="utf-8") as fh:
+                    fh.write(html or "")
+            except Exception:
+                pass
 
         if new_this_round == 0:
-            empty_scrolls += 1
+            empty_rounds += 1
         else:
-            empty_scrolls = 0
+            empty_rounds = 0
 
-        # Scroll down inside the dialog.
-        # ActionChains click on the dialog + Page Down is the most reliable way
-        # to trigger Facebook's IntersectionObserver for lazy-loaded entries
-        # in headless Chrome.  Pure JS scrollTop changes don't fire IO callbacks.
-        try:
-            ActionChains(driver).move_to_element(dialog).click().perform()
-            for _ in range(3):
-                ActionChains(driver).send_keys(Keys.PAGE_DOWN).perform()
-                time.sleep(0.3)
-        except Exception:
-            pass
-
-        # Wait for lazy-loading spinners to be replaced by real content
+        # ── scroll to reveal the next batch ─────────────────────────────
+        driver.execute_script(JS_SCROLL)
         time.sleep(SCROLL_PAUSE)
+        iteration += 1
 
     return all_names
 
@@ -552,7 +688,13 @@ def main() -> None:
         else:
             print("[*] No consent popup detected.")
 
-        # 3. Wait for actual post content to be present
+        # 3. Save full page HTML for debug inspection
+        if DEBUG:
+            with open("debug_page.html", "w", encoding="utf-8") as fh:
+                fh.write(driver.page_source)
+            print("[DEBUG] Saved full page HTML → debug_page.html")
+
+        # 4. Wait for actual post content to be present
         print("[*] Waiting for post content to load...")
         if not wait_for_post_body(driver):
             print("[!] Post body did not appear — the page may be blocked or layout changed.")
@@ -562,7 +704,7 @@ def main() -> None:
             sys.exit(1)
         print("[+] Post content loaded.")
 
-        # 4. Click the 'N shares' button
+        # 5. Click the 'N shares' button
         clicked = click_shares_button(driver)
         if not clicked:
             print("[-] Could not find or click the shares button.")
@@ -572,7 +714,7 @@ def main() -> None:
             print("[!] Saved debug_screenshot.png for inspection.")
             sys.exit(1)
 
-        # 5. Find the shares dialog (only called AFTER button was clicked)
+        # 6. Find the shares dialog (only called AFTER button was clicked)
         dialog = find_shares_dialog(driver)
         if dialog is None:
             print("[-] Shares dialog did not appear after clicking the button.")
@@ -583,14 +725,14 @@ def main() -> None:
         # Brief pause to let dialog render its initial content
         time.sleep(4.0)
 
-        # 6. Scroll and collect
-        names = collect_names_from_dialog(driver, dialog)
+        # 7. Scroll and collect
+        names = collect_names_from_dialog(driver, dialog, debug=DEBUG)
         print(f"[+] Done. Collected {len(names)} unique sharer name(s).")
 
     finally:
         driver.quit()
 
-    # 6. Count and display
+    # 8. Count and display
     share_dict = build_share_counter(names)
     display_results(share_dict)
 
