@@ -68,7 +68,7 @@ SCROLL_PAUSE = 1.2
 MAX_EMPTY_SCROLLS = 10
 
 # Set to True to save dialog HTML snapshots per scroll pass and print per-name debug info
-DEBUG = False
+DEBUG = True
 
 # Holds the raw Selenium WebElement for the aria-label shares container.
 # Populated at runtime so you can inspect it at the breakpoint().
@@ -170,15 +170,25 @@ def _get_facebook_cookies() -> list[dict]:
     cookies: list[dict] = []
 
     # Try to copy first (cleaner); fall back to direct read-only URI (works while Chrome runs)
+    # NOTE: SQLite URI paths on Windows MUST use forward slashes AND the file:///C:/... form.
+    # Using file:C:\path\... (backslashes) or file:C:/path (no triple-slash) both fail.
+
+    def _to_sqlite_uri(path: str, extra: str = "") -> str:
+        """Convert an absolute Windows or POSIX path to a valid SQLite file URI."""
+        fwd = path.replace("\\", "/")
+        if len(fwd) > 1 and fwd[1] == ":":   # Windows drive letter, e.g. C:/...
+            return f"file:///{fwd}{extra}"
+        return f"file:{fwd}{extra}"
+
     tmp_db: str | None = None
     try:
         tmp_db = tempfile.mktemp(suffix="_fb_cookies.db")
         shutil.copy2(cookies_db, tmp_db)
-        db_uri = f"file:{tmp_db}?mode=ro"
+        db_uri = _to_sqlite_uri(tmp_db, "?mode=ro")
     except Exception:
         tmp_db = None
-        # Open the live DB in immutable/read-only mode via SQLite URI
-        db_uri = "file:{}?mode=ro&immutable=1".format(cookies_db.replace("\\", "/"))
+        # Open the live DB in immutable/read-only mode — bypasses SQLite WAL lock
+        db_uri = _to_sqlite_uri(cookies_db, "?mode=ro&immutable=1")
 
     try:
         con = sqlite3.connect(db_uri, uri=True)
@@ -269,11 +279,12 @@ def build_driver() -> webdriver.Chrome:
     return driver
 
 
-def accept_consent(driver: webdriver.Chrome) -> bool:
+def accept_consent(driver: webdriver.Chrome, timeout: int = 8) -> bool:
     """
     Dismiss the cookie/GDPR consent overlay.
     Tries normal click first, then JavaScript click as fallback.
     Returns True if a consent button was found and clicked.
+    Pass a smaller timeout (e.g. 3) for a quick second-pass check.
     """
     xpaths = [
         "//button[contains(.,'Allow all cookies')]",
@@ -287,7 +298,7 @@ def accept_consent(driver: webdriver.Chrome) -> bool:
     ]
     for xpath in xpaths:
         try:
-            btn = WebDriverWait(driver, 8).until(
+            btn = WebDriverWait(driver, timeout).until(
                 EC.presence_of_element_located((By.XPATH, xpath))
             )
             # Scroll into view and try normal click, fall back to JS click
@@ -328,31 +339,57 @@ def wait_for_post_body(driver: webdriver.Chrome, timeout: int = 15) -> bool:
 
 def click_shares_button(driver: webdriver.Chrome) -> bool:
     """
-    Find and click the 'N shares' button on the post page.
+    Find and click the 'N shares' COUNT button on the post page.
+    Pass 1 checks aria-label (most precise — avoids the compose-share button).
+    Pass 2 falls back to visible text content.
     Returns True if successfully clicked, False otherwise.
     """
-    # Find every text node that contains both a digit and the word 'share'
-    candidates = driver.find_elements(
+
+    def _try_click(el) -> bool:
+        try:
+            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+            time.sleep(0.3)
+            try:
+                el.click()
+            except Exception:
+                driver.execute_script("arguments[0].click();", el)
+            return True
+        except Exception:
+            return False
+
+    # Pass 1: aria-label containing 'share' + a digit.
+    # The shares COUNT button has aria-label like "24 shares" or "See 24 shares".
+    # The compose-SHARE action button says just "Share" with no digit — filtered out.
+    for el in driver.find_elements(
+        By.XPATH,
+        "//*[contains(translate(@aria-label,'ABCDEFGHIJKLMNOPQRSTUVWXYZ',"
+        "'abcdefghijklmnopqrstuvwxyz'),'share')]"
+    ):
+        try:
+            lbl = (el.get_attribute('aria-label') or '').strip()
+            if re.search(r'\d', lbl) and re.search(r'share', lbl, re.I):
+                if _try_click(el):
+                    print(f"[+] Clicked shares button (aria-label='{lbl}')")
+                    time.sleep(6.0)
+                    return True
+        except StaleElementReferenceException:
+            continue
+
+    # Pass 2: visible text node containing 'share' + a digit.
+    for el in driver.find_elements(
         By.XPATH,
         "//*[contains(translate(text(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ',"
         "'abcdefghijklmnopqrstuvwxyz'),'share')]"
-    )
-
-    for el in candidates:
+    ):
         try:
             text = el.text.strip()
             if not text:
                 continue
             if re.search(r'\d', text) and re.search(r'share', text, re.I):
-                driver.execute_script("arguments[0].scrollIntoView(true);", el)
-                time.sleep(0.3)
-                try:
-                    el.click()
-                except Exception:
-                    driver.execute_script("arguments[0].click();", el)
-                print(f"[+] Clicked shares button: '{text}'")
-                time.sleep(6.0)   # wait for dialog and its lazy content to load
-                return True
+                if _try_click(el):
+                    print(f"[+] Clicked shares button (text='{text}')")
+                    time.sleep(6.0)
+                    return True
         except StaleElementReferenceException:
             continue
 
@@ -430,6 +467,21 @@ def collect_names_from_dialog(driver: webdriver.Chrome, dialog, debug: bool = Fa
 
     SKIP_LIST = list(SKIP_ARIA | {w.lower() for w in SKIP_WORDS})
 
+    # ── Scope all DOM queries to THIS specific dialog, not just any dialog ─
+    # Problem: Facebook wraps posts/feeds in [role="dialog"] elements for
+    # accessibility, so '[role="dialog"] [role="article"]' would match comment
+    # articles in the main post dialog, not sharer cards in the shares dialog.
+    # Fix: mark the shares dialog with a unique data attribute and use that
+    # attribute as the CSS scope for every article search.
+    _DLG_ATTR = 'data-fb-shares-tracker'
+    _DLG_SEL  = f'[{_DLG_ATTR}="1"] [role="article"]'
+    try:
+        driver.execute_script(
+            f"arguments[0].setAttribute('{_DLG_ATTR}','1');", dialog)
+    except Exception:
+        # If the element is already stale, fall back to generic (less precise)
+        _DLG_SEL = '[role="dialog"] [role="article"]'
+
     # ── JS: extract name from ONE article element ─────────────────────────
     # arguments[0] = the article WebElement
     # arguments[1] = SKIP_LIST
@@ -440,7 +492,7 @@ def collect_names_from_dialog(driver: webdriver.Chrome, dialog, debug: bool = Fa
     #   Strategy order: a[role="link"] → profile_name div → a[aria-label].
     #   Returns {name, href, tid} so the caller can deduplicate by share event,
     #   not by person (same person sharing twice → two distinct tid values).
-    JS_NAME_FROM_ARTICLE = """
+    JS_NAME_FROM_ARTICLE = r"""
         var art  = arguments[0];
         var skip = arguments[1];
 
@@ -483,7 +535,32 @@ def collect_names_from_dialog(driver: webdriver.Chrome, dialog, debug: bool = Fa
 
         if (!name) return null;
 
-        // Extract a per-SHARE unique ID (the share's own permalink).
+        // Strategy 4: first <a> whose href looks like a Facebook profile URL.
+        // Covers /username, /profile.php?id=..., /people/... patterns.
+        if (!name) {
+            var allAs = art.querySelectorAll('a[href]');
+            for (var i = 0; i < allAs.length; i++) {
+                var h = allAs[i].href || '';
+                if (/facebook\.com\/(profile\.php|people\/|[^\/\?#]{3,}\/?$)/.test(h)) {
+                    var t = ok(allAs[i].textContent);
+                    if (t) { name = t; href = h; break; }
+                }
+            }
+        }
+
+        // Strategy 5: brute-force — first leaf <span> whose text passes ok().
+        // Catches any layout where the name sits in a bare span with no role attr.
+        if (!name) {
+            var spans = art.querySelectorAll('span');
+            for (var i = 0; i < spans.length; i++) {
+                // leaf spans only: no child spans (avoids concatenated text)
+                if (spans[i].querySelector('span')) continue;
+                var t = ok(spans[i].textContent);
+                if (t) { name = t; break; }
+            }
+        }
+
+        if (!name) return null;
         // This lets us count the same person sharing twice as two distinct events.
         var shareLinks = art.querySelectorAll('a[href*="/posts/"], a[href*="/permalink/"]');
         for (var i = 0; i < shareLinks.length; i++) {
@@ -497,54 +574,57 @@ def collect_names_from_dialog(driver: webdriver.Chrome, dialog, debug: bool = Fa
     """
 
     # ── JS: scroll the dialog so the next batch of articles loads ─────────
-    # Targets ONLY the dialog, not the whole page.
-    # Three triggers every call:
-    #   1. scrollTop = scrollHeight on every overflow container inside the dialog
-    #   2. WheelEvent on those containers + the dialog root
-    #   3. scrollIntoView on the very last child of the last article
-    #      → this fires Facebook's IntersectionObserver (virtual-list loader)
+    # arguments[0] = step in pixels (SCROLL_STEP_PX).
+    # Key fix: use scrollHeight > clientHeight to detect the scrollable container.
+    # CSS overflowY can be 'hidden' or 'clip' even when the element IS scrollable
+    # (FB uses this pattern), so the previous CSS-property check missed it.
     JS_SCROLL = """
-        var dialogs = document.querySelectorAll('[role="dialog"]');
-        var dlg     = dialogs.length ? dialogs[dialogs.length - 1] : null;
-        if (!dlg) return;
+        var step = arguments[0];
+        var dlg = document.querySelector('[data-fb-shares-tracker="1"]');
+        if (!dlg) {
+            var _dlgs = document.querySelectorAll('[role="dialog"]');
+            dlg = _dlgs.length ? _dlgs[_dlgs.length - 1] : null;
+        }
+        if (!dlg) return false;
 
-        var all = dlg.querySelectorAll('*');
-        for (var i = 0; i < all.length; i++) {
-            var ov = window.getComputedStyle(all[i]).overflowY;
-            if (ov === 'scroll' || ov === 'auto') {
-                all[i].scrollTop = all[i].scrollHeight;
-                all[i].dispatchEvent(new WheelEvent('wheel', {
-                    deltaY: 800, deltaMode: 0, bubbles: true, cancelable: true
+        // Any element whose scrollHeight > clientHeight has scrollable content,
+        // regardless of its CSS overflow value.
+        var targets = [dlg].concat(Array.prototype.slice.call(dlg.querySelectorAll('*')));
+        var scrolled = false;
+        for (var i = 0; i < targets.length; i++) {
+            var el = targets[i];
+            if (el.scrollHeight > el.clientHeight + 2) {
+                var before = el.scrollTop;
+                el.scrollTop += step;
+                if (el.scrollTop !== before) scrolled = true;
+                el.dispatchEvent(new WheelEvent('wheel', {
+                    deltaY: step, deltaMode: 0, bubbles: true, cancelable: true
                 }));
             }
         }
-        dlg.dispatchEvent(new WheelEvent('wheel', {
-            deltaY: 800, deltaMode: 0, bubbles: true, cancelable: true
-        }));
 
+        // scrollIntoView on the very last article's last child
+        // → fires Facebook's IntersectionObserver (virtual-list loader)
         var arts = dlg.querySelectorAll('[role="article"]');
         if (arts.length > 0) {
             var last = arts[arts.length - 1];
-            // scroll the last child of the last article into view
-            // → this triggers IntersectionObserver for the loading sentinel below it
             var lastChild = last.lastElementChild || last;
             lastChild.scrollIntoView({behavior: 'instant', block: 'end'});
         }
+        return scrolled;
     """
 
     all_names: list[str] = []  # duplicates kept — same person sharing N times = N entries
-    # Dedup key = (name, profile_href, share_tid).
-    # – Prevents false duplicates when the virtual list recycles DOM nodes across passes.
-    # – Still allows genuine multiple shares by the same person (different tid per share).
     seen_shares: set[tuple] = set()
     empty_rounds = 0
+    consecutive_loading_stall = 0   # passes where ONLY skeleton articles appear
+    MAX_LOADING_STALL = 6           # give up if skeletons never resolve
     iteration = 0
 
     # Wait up to 15 s for the first sharer cards to appear
     print("[*] Waiting for sharer cards to render...")
     for _w in range(15):
-        _initial = driver.find_elements(
-            By.CSS_SELECTOR, '[role="dialog"] [role="article"]')
+        _initial = driver.find_elements(By.CSS_SELECTOR, _DLG_SEL)
         if _initial:
             break
         time.sleep(1.0)
@@ -555,15 +635,42 @@ def collect_names_from_dialog(driver: webdriver.Chrome, dialog, debug: bool = Fa
 
     while empty_rounds < MAX_EMPTY_SCROLLS:
 
-        # ── fetch ALL currently visible articles fresh from the document root ─
+        # ── fetch articles from the MARKED shares dialog only ───────────
         try:
-            articles = driver.find_elements(
-                By.CSS_SELECTOR, '[role="dialog"] [role="article"]')
+            articles = driver.find_elements(By.CSS_SELECTOR, _DLG_SEL)
         except Exception:
             break
 
         new_this_round = 0
+        loading_this_round = 0
         for article in articles:
+            # ── Skip skeleton/loading placeholder articles ─────────────────
+            # FB renders shimmer-placeholder articles (aria-label="Loading...")
+            # while waiting for real data; these have no name to extract.
+            try:
+                if article.find_elements(By.CSS_SELECTOR, '[aria-label="Loading..."]'):
+                    loading_this_round += 1
+                    continue
+            except StaleElementReferenceException:
+                continue
+            except Exception:
+                pass
+
+            # ── Scroll this article into view one by one ──────────────────
+            # Brings each card into the viewport before extracting its name.
+            # This triggers IntersectionObserver incrementally so FB's virtual
+            # list loads names/avatars progressively instead of skipping items.
+            try:
+                driver.execute_script(
+                    "arguments[0].scrollIntoView({behavior:'instant',block:'nearest'});",
+                    article,
+                )
+                time.sleep(0.15)   # let lazy content (aria-labels, spans) render
+            except StaleElementReferenceException:
+                continue
+            except Exception:
+                pass   # non-fatal — try name extraction anyway
+
             try:
                 result = driver.execute_script(JS_NAME_FROM_ARTICLE, article, SKIP_LIST)
             except (StaleElementReferenceException, Exception):
@@ -596,7 +703,23 @@ def collect_names_from_dialog(driver: webdriver.Chrome, dialog, debug: bool = Fa
             new_this_round += 1
             print(f"  [+] ({len(all_names)}) {name}")
 
-        print(f"  [pass {iteration}] DOM articles: {len(articles)}, "
+        # Diagnostic: on the very first pass with 0 results, dump article HTML
+        if loading_this_round:
+            print(f"  [pass {iteration}] {loading_this_round} skeleton article(s) still loading — skipped")
+        if iteration == 0 and new_this_round == 0 and articles:
+            try:
+                art_html = driver.execute_script(
+                    "return arguments[0].outerHTML;", articles[0])
+                with open("debug_article_0.html", "w", encoding="utf-8") as fh:
+                    fh.write(art_html or "(empty)")
+                print("  [DIAG] 0 names on first pass — saved first article HTML "
+                      "\u2192 debug_article_0.html  (open it to inspect the DOM)")
+            except Exception as _de:
+                print(f"  [DIAG] Could not dump article HTML: {_de}")
+
+        real_articles = len(articles) - loading_this_round
+        print(f"  [pass {iteration}] DOM articles: {len(articles)} "
+              f"({real_articles} real, {loading_this_round} loading), "
               f"new unique shares: {new_this_round}, "
               f"total so far: {len(all_names)}, "
               f"empty rounds: {empty_rounds}/{MAX_EMPTY_SCROLLS}")
@@ -604,20 +727,56 @@ def collect_names_from_dialog(driver: webdriver.Chrome, dialog, debug: bool = Fa
         if debug:
             try:
                 html = driver.execute_script(
-                    "var d=document.querySelectorAll('[role=\"dialog\"]');"
-                    "return d.length?d[d.length-1].outerHTML:'';")
+                    "var d=document.querySelector('[data-fb-shares-tracker=\"1\"]');"
+                    "if(!d){var ds=document.querySelectorAll('[role=\"dialog\"]');"
+                    "d=ds.length?ds[ds.length-1]:null;}"
+                    "return d?d.outerHTML:'';")
                 with open(f"debug_dialog_pass{iteration}.html", "w", encoding="utf-8") as fh:
                     fh.write(html or "")
             except Exception:
                 pass
 
-        if new_this_round == 0:
-            empty_rounds += 1
-        else:
+        # Update counters.
+        # loading_stall: consecutive passes where ONLY skeleton cards appear.
+        # If skeletons never resolve, FB requires login to see those shares.
+        if new_this_round > 0:
             empty_rounds = 0
+            consecutive_loading_stall = 0
+        elif loading_this_round > 0:
+            # Skeletons present but nothing new — might still be loading
+            consecutive_loading_stall += 1
+            if consecutive_loading_stall >= MAX_LOADING_STALL:
+                print(f"[!] {loading_this_round} share(s) have been stuck loading "
+                      f"for {consecutive_loading_stall} passes.")
+                print("    Facebook requires you to be logged in to view these shares.")
+                print("    Close Chrome, run the script again — your Chrome cookies")
+                print("    will be injected automatically.")
+                break
+        else:
+            empty_rounds += 1
+            consecutive_loading_stall = 0
 
-        # ── scroll to reveal the next batch ─────────────────────────────
-        driver.execute_script(JS_SCROLL)
+        # Hard cap: stop after 5 × MAX_EMPTY_SCROLLS total passes regardless.
+        if iteration >= MAX_EMPTY_SCROLLS * 5:
+            print("[!] Max total iterations reached. "
+                  "If shares are missing, try running while logged in to Chrome.")
+            break
+
+        # ── scroll the dialog: JS + Selenium keyboard fallback ────────────
+        scrolled = driver.execute_script(JS_SCROLL, SCROLL_STEP_PX)
+        # Supplement with a keyboard PAGE_DOWN on the dialog element, which
+        # works even when JS scrollTop manipulation is blocked by FB's layout.
+        try:
+            dlg_el = driver.find_element(By.CSS_SELECTOR, '[data-fb-shares-tracker="1"]')
+            ActionChains(driver).move_to_element(dlg_el).click().send_keys(Keys.PAGE_DOWN).perform()
+        except Exception:
+            pass
+        if not scrolled:
+            # JS scroll reported nothing moved — try scrolling the active element
+            driver.execute_script(
+                "var el=document.activeElement;"
+                "if(el && el.scrollHeight>el.clientHeight+2) el.scrollTop+=arguments[0];",
+                SCROLL_STEP_PX)
         time.sleep(SCROLL_PAUSE)
         iteration += 1
 
@@ -722,8 +881,15 @@ def main() -> None:
 
         print("[+] Shares dialog found. Collecting names...")
 
-        # Brief pause to let dialog render its initial content
-        time.sleep(4.0)
+        # Dismiss any secondary cookie/login overlay that FB may show
+        # anonymously (or to EU users) when the shares dialog opens.
+        # Use a short timeout so we don't stall if no overlay appears.
+        if accept_consent(driver, timeout=4):
+            print("[+] Secondary overlay dismissed — waiting for shares to load.")
+            time.sleep(3.0)
+        else:
+            # Brief pause to let dialog render its initial content
+            time.sleep(4.0)
 
         # 7. Scroll and collect
         names = collect_names_from_dialog(driver, dialog, debug=DEBUG)
